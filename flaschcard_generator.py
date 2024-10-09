@@ -27,12 +27,23 @@ class FlashcardGenerator:
         class State(Dict):
             study_materials: str
             flashcards: List[Dict[str, str]]
+            reflection: str
             end: bool
 
         workflow = StateGraph(State)
+        
+        # Add nodes
         workflow.add_node("create_flashcards", self._create_flashcards)
+        workflow.add_node("reflect_on_coverage", self._reflect_on_coverage)
+        workflow.add_node("update_flashcards", self._update_flashcards)
+        
+        # Set entry point
         workflow.set_entry_point("create_flashcards")
-        workflow.add_edge("create_flashcards", END)
+        
+        # Add edges
+        workflow.add_edge("create_flashcards", "reflect_on_coverage")
+        workflow.add_edge("reflect_on_coverage", "update_flashcards")
+        workflow.add_edge("update_flashcards", END)
 
         return workflow.compile()
 
@@ -105,8 +116,8 @@ class FlashcardGenerator:
 
         [
         {
-            "question": "Clear, focused question",
-            "answer": "Direct Answer:
+        "question": "Clear, focused question",
+        "answer": "Direct Answer:
         A clear, initial explanation of the concept.
 
         Analogy:
@@ -149,7 +160,91 @@ class FlashcardGenerator:
             self.logger.error(f"LLM response: {response.content}")
             flashcards = []
 
-        return {"flashcards": flashcards, "end": True}
+        return {"flashcards": flashcards}
+
+    def _reflect_on_coverage(self, state: Dict) -> Dict:
+        self.logger.info("Reflecting on flashcard coverage")
+        prompt = """
+        You are tasked with reviewing the generated flashcards and the original study materials to ensure comprehensive coverage. Please analyze both and provide a reflection on the following:
+
+        1. Are there any important concepts or topics from the study materials that are not covered in the flashcards?
+        2. Are there any areas where the flashcards could be more detailed or provide better explanations?
+        3. Are there any redundant or overly similar flashcards that could be combined or removed?
+        4. Are there any complex topics that might benefit from being broken down into multiple flashcards?
+
+        Provide your reflection in a clear, concise manner, highlighting specific areas for improvement or addition.
+        """
+
+        response = self.llm.invoke(prompt + "\n\nStudy materials:\n" + state["study_materials"] + "\n\nFlashcards:\n" + json.dumps(state["flashcards"], indent=2))
+        reflection = response.content.strip()
+
+        return {"reflection": reflection}
+
+    def _update_flashcards(self, state: Dict) -> Dict:
+        self.logger.info("Updating flashcards based on reflection")
+        prompt = """
+        Based on the original study materials, the initially generated flashcards, and the reflection provided, please update the flashcards to ensure comprehensive coverage of all concepts. You should:
+
+        1. Add new flashcards for any missing concepts identified in the reflection.
+        2. Modify existing flashcards to provide more detailed explanations where needed.
+        3. Remove or combine any redundant flashcards.
+        4. Break down complex topics into multiple flashcards if necessary.
+
+        Most importantly, ensure that each flashcard strictly follows this format:
+
+        {
+        "question": "Clear, focused question",
+        "answer": "Direct Answer:
+        A clear, initial explanation of the concept.
+
+        Analogy:
+        A relatable real-world comparison that makes the concept easier to understand.
+
+        Detailed Explanation:
+        A comprehensive breakdown with examples and additional context.
+
+        Practical Application:
+        A concrete real-world scenario where this concept is applied."
+        }
+
+        Remember to:
+        - Include all four sections (Direct Answer, Analogy, Detailed Explanation, Practical Application) for each flashcard.
+        - Ensure each section starts with its header (e.g., "Direct Answer:", "Analogy:") on a new line.
+        - Include a blank line between sections for better readability.
+        - Make the answer a continuous string with line breaks (\n) for formatting.
+        - Use clear, jargon-free language and break down complex ideas.
+        - Include creative, memorable analogies related to common experiences.
+        - Provide a mix of question types (definition, process, reasoning, comparison, application, problem-solving).
+        - Ensure each flashcard is self-contained and independently comprehensible.
+
+        Provide the updated flashcards in valid JSON format without any additional text or formatting.
+        """
+
+        response = self.llm.invoke(prompt + "\n\nStudy materials:\n" + state["study_materials"] + 
+                                "\n\nInitial Flashcards:\n" + json.dumps(state["flashcards"], indent=2) + 
+                                "\n\nReflection:\n" + state["reflection"])
+    
+        content = response.content.strip()
+        if content.startswith("```") and content.endswith("```"):
+            content = "\n".join(content.split("\n")[1:-1]).strip()
+
+        try:
+            updated_flashcards = json.loads(content)
+            if not isinstance(updated_flashcards, list):
+                raise ValueError("Updated flashcards should be a list")
+            for card in updated_flashcards:
+                if not isinstance(card, dict) or "question" not in card or "answer" not in card:
+                    raise ValueError("Invalid flashcard format")
+                # Check if the answer contains all required sections
+                required_sections = ["Direct Answer:", "Analogy:", "Detailed Explanation:", "Practical Application:"]
+                if not all(section in card["answer"] for section in required_sections):
+                    raise ValueError(f"Flashcard missing required sections: {card['question']}")
+        except (json.JSONDecodeError, ValueError) as e:
+            self.logger.error(f"Error parsing updated flashcards: {str(e)}")
+            self.logger.error(f"LLM response: {response.content}")
+            updated_flashcards = state["flashcards"]  # Fallback to original flashcards
+
+        return {"flashcards": updated_flashcards, "end": True}
 
     def generate_flashcards(self, study_materials: str, file_name: str) -> Dict:
         if not study_materials or not isinstance(study_materials, str):
@@ -159,6 +254,7 @@ class FlashcardGenerator:
             initial_state = {
                 "study_materials": study_materials,
                 "flashcards": [],
+                "reflection": "",
                 "end": False,
             }
             self.logger.info(f"Initial state: {initial_state}")
